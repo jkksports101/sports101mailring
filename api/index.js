@@ -3,30 +3,10 @@ import "dotenv/config";
 import express from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
-// shared/const.ts
-var COOKIE_NAME = "app_session_id";
-var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
-var AXIOS_TIMEOUT_MS = 3e4;
-var UNAUTHED_ERR_MSG = "Please login (10001)";
-var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
-var OAUTH_STATE_COOKIE = "__Host-oauth_state";
-var decodeOAuthState = (state) => {
-  let decoded;
-  try {
-    decoded = atob(state);
-  } catch {
-    return { redirectUri: "" };
-  }
-  try {
-    const parsed = JSON.parse(decoded);
-    if (parsed && typeof parsed.redirectUri === "string") return parsed;
-  } catch {
-  }
-  return { redirectUri: decoded };
-};
-
-// server/_core/oauth.ts
-import { parse as parseCookieHeader2 } from "cookie";
+// server/_core/localAuth.ts
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+import { z } from "zod";
 
 // server/db.ts
 import { and, eq, inArray } from "drizzle-orm";
@@ -40,6 +20,7 @@ var users = mysqlTable("users", {
   name: text("name"),
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
+  passwordHash: varchar("passwordHash", { length: 255 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
@@ -80,6 +61,7 @@ var ENV = {
   cookieSecret: process.env.JWT_SECRET ?? "",
   databaseUrl: process.env.DATABASE_URL ?? "",
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
+  canonicalAppUrl: process.env.CANONICAL_APP_URL ?? "https://sports101mailring.vercel.app",
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
@@ -132,6 +114,24 @@ async function getUserByOpenId(openId) {
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result[0];
 }
+async function getUserByEmail(email) {
+  const db = await getDb();
+  if (!db) return void 0;
+  const result = await db.select().from(users).where(eq(users.email, email)).limit(1);
+  return result[0];
+}
+async function createLocalUser(input) {
+  const db = await getDb();
+  if (!db) throw new Error("Database is not configured");
+  await db.insert(users).values({
+    openId: input.openId,
+    email: input.email,
+    name: input.name,
+    passwordHash: input.passwordHash,
+    loginMethod: "password"
+  });
+  return getUserByOpenId(input.openId);
+}
 async function getTargetOrganizations(filters = {}) {
   const db = await getDb();
   if (!db) return [];
@@ -161,22 +161,28 @@ async function getSendableTargetsByIds(ids) {
   return db.select({ id: targetOrganizations.id, email: targetOrganizations.contactEmail, name: targetOrganizations.contactName, organizationName: targetOrganizations.organizationName }).from(targetOrganizations).where(and(inArray(targetOrganizations.id, ids), eq(targetOrganizations.unsubscribed, 0)));
 }
 
-// server/_core/cookies.ts
-function isSecureRequest(req) {
-  if (req.protocol === "https") return true;
-  const forwardedProto = req.headers["x-forwarded-proto"];
-  if (!forwardedProto) return false;
-  const protoList = Array.isArray(forwardedProto) ? forwardedProto : forwardedProto.split(",");
-  return protoList.some((proto) => proto.trim().toLowerCase() === "https");
-}
-function getSessionCookieOptions(req) {
-  return {
-    httpOnly: true,
-    path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req)
-  };
-}
+// shared/const.ts
+var COOKIE_NAME = "app_session_id";
+var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
+var AXIOS_TIMEOUT_MS = 3e4;
+var UNAUTHED_ERR_MSG = "Please login (10001)";
+var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
+var OAUTH_STATE_COOKIE = "__Host-oauth_state";
+var encodeOAuthState = (state) => btoa(JSON.stringify(state));
+var decodeOAuthState = (state) => {
+  let decoded;
+  try {
+    decoded = atob(state);
+  } catch {
+    return { redirectUri: "" };
+  }
+  try {
+    const parsed = JSON.parse(decoded);
+    if (parsed && typeof parsed.redirectUri === "string") return parsed;
+  } catch {
+  }
+  return { redirectUri: decoded };
+};
 
 // shared/_core/errors.ts
 var HttpError = class extends Error {
@@ -435,20 +441,110 @@ function buildCronUser(userInfo) {
 }
 var sdk = new SDKServer();
 
+// server/_core/cookies.ts
+function isSecureRequest(req) {
+  if (req.protocol === "https") return true;
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  if (!forwardedProto) return false;
+  const protoList = Array.isArray(forwardedProto) ? forwardedProto : forwardedProto.split(",");
+  return protoList.some((proto) => proto.trim().toLowerCase() === "https");
+}
+function getSessionCookieOptions(req) {
+  return {
+    httpOnly: true,
+    path: "/",
+    sameSite: "none",
+    secure: isSecureRequest(req)
+  };
+}
+
+// server/_core/localAuth.ts
+var scrypt = promisify(scryptCallback);
+var PASSWORD_HASH_VERSION = "scrypt-v1";
+var KEY_LENGTH = 64;
+var registerSchema = z.object({
+  email: z.string().trim().toLowerCase().email().max(320),
+  name: z.string().trim().min(1).max(120),
+  password: z.string().min(8).max(128)
+});
+var loginSchema = z.object({
+  email: z.string().trim().toLowerCase().email().max(320),
+  password: z.string().min(1).max(128)
+});
+function localOpenId(email) {
+  return `local_${createHash("sha256").update(email).digest("hex").slice(0, 58)}`;
+}
+async function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const derivedKey = await scrypt(password, salt, KEY_LENGTH);
+  return `${PASSWORD_HASH_VERSION}$${salt}$${derivedKey.toString("hex")}`;
+}
+async function verifyPassword(password, encodedHash) {
+  if (!encodedHash) return false;
+  const [version, salt, storedHex] = encodedHash.split("$");
+  if (version !== PASSWORD_HASH_VERSION || !salt || !storedHex || storedHex.length !== KEY_LENGTH * 2) return false;
+  const derivedKey = await scrypt(password, salt, KEY_LENGTH);
+  const storedKey = Buffer.from(storedHex, "hex");
+  return storedKey.length === derivedKey.length && timingSafeEqual(storedKey, derivedKey);
+}
+function setSession(res, req, user) {
+  return sdk.createSessionToken(user.openId, { name: user.name ?? "" }).then((token) => {
+    res.cookie(COOKIE_NAME, token, { ...getSessionCookieOptions(req), maxAge: ONE_YEAR_MS });
+  });
+}
+function registerLocalAuthRoutes(app) {
+  app.post("/api/auth/register", async (req, res) => {
+    const parsed = registerSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "\uC774\uBA54\uC77C, \uC774\uB984, \uBE44\uBC00\uBC88\uD638\uB97C \uC62C\uBC14\uB974\uAC8C \uC785\uB825\uD574 \uC8FC\uC138\uC694." });
+    const { email, name, password } = parsed.data;
+    try {
+      if (await getUserByEmail(email)) return res.status(409).json({ error: "\uC774\uBBF8 \uB4F1\uB85D\uB41C \uC774\uBA54\uC77C\uC785\uB2C8\uB2E4." });
+      const user = await createLocalUser({ email, name, passwordHash: await hashPassword(password), openId: localOpenId(email) });
+      if (!user) return res.status(500).json({ error: "\uACC4\uC815\uC744 \uC0DD\uC131\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." });
+      await setSession(res, req, user);
+      return res.status(201).json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    } catch (error) {
+      console.error("[LocalAuth] Registration failed", error);
+      return res.status(500).json({ error: "\uACC4\uC815\uC744 \uC0DD\uC131\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4." });
+    }
+  });
+  app.post("/api/auth/login", async (req, res) => {
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "\uC774\uBA54\uC77C\uACFC \uBE44\uBC00\uBC88\uD638\uB97C \uC62C\uBC14\uB974\uAC8C \uC785\uB825\uD574 \uC8FC\uC138\uC694." });
+    const { email, password } = parsed.data;
+    try {
+      const user = await getUserByEmail(email);
+      const valid = user ? await verifyPassword(password, user.passwordHash) : false;
+      if (!user || !valid) return res.status(401).json({ error: "\uC774\uBA54\uC77C \uB610\uB294 \uBE44\uBC00\uBC88\uD638\uAC00 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4." });
+      await setSession(res, req, user);
+      return res.json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    } catch (error) {
+      console.error("[LocalAuth] Login failed", error);
+      return res.status(500).json({ error: "\uB85C\uADF8\uC778\uC5D0 \uC2E4\uD328\uD588\uC2B5\uB2C8\uB2E4." });
+    }
+  });
+}
+
 // server/_core/oauth.ts
+import { parse as parseCookieHeader2 } from "cookie";
 function getQueryParam(req, key) {
   const value = req.query[key];
   return typeof value === "string" ? value : void 0;
 }
-function registerOAuthRoutes(app2) {
-  app2.get("/api/oauth/callback", async (req, res) => {
+function registerOAuthRoutes(app) {
+  app.get("/api/oauth/callback", async (req, res) => {
     const code = getQueryParam(req, "code");
     const state = getQueryParam(req, "state");
     if (!code || !state) {
       res.status(400).json({ error: "code and state are required" });
       return;
     }
-    const { nonce } = decodeOAuthState(state);
+    const { redirectUri: requestedRedirectUri, nonce } = decodeOAuthState(state);
+    const canonicalRedirectUri = `${ENV.canonicalAppUrl.replace(/\/$/, "")}/api/oauth/callback`;
+    if (requestedRedirectUri !== canonicalRedirectUri) {
+      res.status(400).json({ error: "redirect URI must use the production callback" });
+      return;
+    }
     const expectedNonce = parseCookieHeader2(req.headers.cookie ?? "")[OAUTH_STATE_COOKIE];
     if (!nonce || nonce !== expectedNonce) {
       res.status(403).json({ error: "invalid oauth state" });
@@ -456,7 +552,8 @@ function registerOAuthRoutes(app2) {
     }
     res.clearCookie(OAUTH_STATE_COOKIE, { path: "/", secure: true, sameSite: "none" });
     try {
-      const tokenResponse = await sdk.exchangeCodeForToken(code, state);
+      const canonicalState = encodeOAuthState({ redirectUri: canonicalRedirectUri, nonce });
+      const tokenResponse = await sdk.exchangeCodeForToken(code, canonicalState);
       const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
       if (!userInfo.openId) {
         res.status(400).json({ error: "openId missing from user info" });
@@ -484,8 +581,8 @@ function registerOAuthRoutes(app2) {
 }
 
 // server/_core/storageProxy.ts
-function registerStorageProxy(app2) {
-  app2.get("/manus-storage/*", async (req, res) => {
+function registerStorageProxy(app) {
+  app.get("/manus-storage/*", async (req, res) => {
     const key = req.params[0];
     if (!key) {
       res.status(400).send("Missing storage key");
@@ -525,7 +622,7 @@ function registerStorageProxy(app2) {
 }
 
 // server/_core/systemRouter.ts
-import { z } from "zod";
+import { z as z2 } from "zod";
 
 // server/_core/notification.ts
 import { TRPCError } from "@trpc/server";
@@ -648,16 +745,16 @@ var adminProcedure = t.procedure.use(
 // server/_core/systemRouter.ts
 var systemRouter = router({
   health: publicProcedure.input(
-    z.object({
-      timestamp: z.number().min(0, "timestamp cannot be negative")
+    z2.object({
+      timestamp: z2.number().min(0, "timestamp cannot be negative")
     })
   ).query(() => ({
     ok: true
   })),
   notifyOwner: adminProcedure.input(
-    z.object({
-      title: z.string().min(1, "title is required"),
-      content: z.string().min(1, "content is required")
+    z2.object({
+      title: z2.string().min(1, "title is required"),
+      content: z2.string().min(1, "content is required")
     })
   ).mutation(async ({ input }) => {
     const delivered = await notifyOwner(input);
@@ -833,9 +930,9 @@ async function sendStibeeEmail(emailId, subject, body) {
 }
 
 // server/routers.ts
-import { z as z2 } from "zod";
-var filterSchema = z2.object({ organizationTypes: z2.array(z2.string()).optional(), provinces: z2.array(z2.string()).optional(), industries: z2.array(z2.string()).optional() });
-var targetInput = z2.object({ id: z2.number(), email: z2.string().email(), name: z2.string().optional(), organizationName: z2.string().optional() });
+import { z as z3 } from "zod";
+var filterSchema = z3.object({ organizationTypes: z3.array(z3.string()).optional(), provinces: z3.array(z3.string()).optional(), industries: z3.array(z3.string()).optional() });
+var targetInput = z3.object({ id: z3.number(), email: z3.string().email(), name: z3.string().optional(), organizationName: z3.string().optional() });
 var appRouter = router({
   system: systemRouter,
   auth: router({
@@ -855,11 +952,11 @@ var appRouter = router({
     })
   }),
   ai: router({
-    draft: protectedProcedure.input(z2.object({ audienceType: z2.string(), organizationName: z2.string().optional(), offer: z2.string().optional(), campaignGoal: z2.string().optional() })).mutation(({ input }) => generateGeminiDraft(input))
+    draft: protectedProcedure.input(z3.object({ audienceType: z3.string(), organizationName: z3.string().optional(), offer: z3.string().optional(), campaignGoal: z3.string().optional() })).mutation(({ input }) => generateGeminiDraft(input))
   }),
   stibee: router({
-    sync: protectedProcedure.input(z2.object({ listId: z2.string().min(1), targets: z2.array(targetInput).min(1) })).mutation(({ input }) => syncStibeeSubscribers(input.listId, input.targets.map((target) => ({ email: target.email, name: target.name, organizationName: target.organizationName })))),
-    send: protectedProcedure.input(z2.object({ emailId: z2.string().min(1), listId: z2.string().min(1), targets: z2.array(targetInput).min(1), subject: z2.string().min(1), body: z2.string().min(1), confirmed: z2.literal(true) })).mutation(async ({ input }) => {
+    sync: protectedProcedure.input(z3.object({ listId: z3.string().min(1), targets: z3.array(targetInput).min(1) })).mutation(({ input }) => syncStibeeSubscribers(input.listId, input.targets.map((target) => ({ email: target.email, name: target.name, organizationName: target.organizationName })))),
+    send: protectedProcedure.input(z3.object({ emailId: z3.string().min(1), listId: z3.string().min(1), targets: z3.array(targetInput).min(1), subject: z3.string().min(1), body: z3.string().min(1), confirmed: z3.literal(true) })).mutation(async ({ input }) => {
       const sendable = await getSendableTargetsByIds(input.targets.map((target) => target.id));
       if (!sendable.length) throw new Error("DB\uC5D0\uC11C \uBC1C\uC1A1 \uAC00\uB2A5\uD55C \uD0C0\uAE43\uC744 \uCC3E\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4. \uC218\uC2E0\uAC70\uBD80 \uB610\uB294 \uCD5C\uC2E0 \uD544\uD130 \uC0C1\uD0DC\uB97C \uD655\uC778\uD558\uC138\uC694.");
       const sync = await syncStibeeSubscribers(input.listId, sendable.map((target) => ({ ...target, name: target.name ?? void 0 })));
@@ -886,24 +983,24 @@ async function createContext(opts) {
 
 // server/app.ts
 function createApiApp() {
-  const app2 = express();
-  app2.use(express.json({ limit: "50mb" }));
-  app2.use(express.urlencoded({ limit: "50mb", extended: true }));
-  registerStorageProxy(app2);
-  registerOAuthRoutes(app2);
-  app2.use(
+  const app = express();
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  registerStorageProxy(app);
+  registerLocalAuthRoutes(app);
+  registerOAuthRoutes(app);
+  app.use(
     "/api/trpc",
     createExpressMiddleware({
       router: appRouter,
       createContext
     })
   );
-  return app2;
+  return app;
 }
 
 // api/index.ts
-var app = createApiApp();
-var index_default = app;
+var index_default = createApiApp();
 export {
   index_default as default
 };
