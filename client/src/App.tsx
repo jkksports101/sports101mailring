@@ -1,10 +1,12 @@
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useEffect } from "react";
 import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import Home from "./pages/Home";
+import { startLogin } from "./const";
 
 function Router() {
   // make sure to consider if you need authentication for certain routes
@@ -23,6 +25,18 @@ function Router() {
 //   to keep consistent foreground/background color across components
 // - If you want to make theme switchable, pass `switchable` ThemeProvider and use `useTheme` hook
 
+function OAuthRedirectBootstrap() {
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("oauth") !== "1") return;
+
+    window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    startLogin();
+  }, []);
+
+  return null;
+}
+
 function App() {
   return (
     <ErrorBoundary>
@@ -32,6 +46,7 @@ function App() {
       >
         <TooltipProvider>
           <Toaster />
+          <OAuthRedirectBootstrap />
           <Router />
         </TooltipProvider>
       </ThemeProvider>
